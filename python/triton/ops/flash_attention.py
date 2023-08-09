@@ -23,16 +23,17 @@ def _fwd_kernel(
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vk, stride_vn,
     stride_oz, stride_oh, stride_om, stride_on,
-    Z, H, N_CTX,
+    Z, H, N_CTX, P_SEQ,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    qvk_offset = off_hz * stride_qh
+    q_offset = off_hz * stride_qh
+    kv_offset = off_hz * stride_kh
     Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
+        base=Q + q_offset,
         shape=(N_CTX, BLOCK_DMODEL),
         strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0),
@@ -40,16 +41,16 @@ def _fwd_kernel(
         order=(1, 0)
     )
     K_block_ptr = tl.make_block_ptr(
-        base=K + qvk_offset,
-        shape=(BLOCK_DMODEL, N_CTX),
+        base=K + kv_offset,
+        shape=(BLOCK_DMODEL, N_CTX + P_SEQ),
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
         block_shape=(BLOCK_DMODEL, BLOCK_N),
         order=(0, 1)
     )
     V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
+        base=V + kv_offset,
+        shape=(N_CTX + P_SEQ, BLOCK_DMODEL),
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
         block_shape=(BLOCK_N, BLOCK_DMODEL),
@@ -71,7 +72,7 @@ def _fwd_kernel(
     q = tl.load(Q_block_ptr)
     q = (q * qk_scale).to(K.dtype.element_ty)
     lo = 0
-    hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX
+    hi = P_SEQ + (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX + P_SEQ
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
         k = tl.load(K_block_ptr)
@@ -79,7 +80,7 @@ def _fwd_kernel(
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+            qk = tl.where(P_SEQ + offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         qk += tl.dot(q, k, allow_tf32=True)
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -101,7 +102,7 @@ def _fwd_kernel(
     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
     # write back O
     O_block_ptr = tl.make_block_ptr(
-        base=Out + qvk_offset,
+        base=Out + q_offset,
         shape=(N_CTX, BLOCK_DMODEL),
         strides=(stride_om, stride_on),
         offsets=(start_m * BLOCK_M, 0),
@@ -138,8 +139,8 @@ def _bwd_kernel_one_col_block(
     stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vk, stride_vn,
-    Z, H, N_CTX,
-    off_hz, start_n, num_block,
+    Z, H, N_CTX, P_SEQ,
+    off_hz, start_n, num_block_m,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SEQUENCE_PARALLEL: tl.constexpr,
@@ -148,7 +149,7 @@ def _bwd_kernel_one_col_block(
     if SEQUENCE_PARALLEL:
         DQ += stride_dqa.to(tl.int64) * start_n
     if CAUSAL:
-        lo = start_n * BLOCK_M
+        lo = tl.math.max(start_n * BLOCK_M - P_SEQ, 0)
     else:
         lo = 0
     # initialize row/col offsets
@@ -165,21 +166,21 @@ def _bwd_kernel_one_col_block(
     # pointer to row-wise quantities in value-like data
     D_ptrs = D + off_hz * N_CTX
     l_ptrs = L + off_hz * N_CTX
-    # initialize dv amd dk
-    dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    # initialize dk amd dv
     dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     # k and v stay in SRAM throughout
     k = tl.load(k_ptrs)
     v = tl.load(v_ptrs)
     # loop over rows
-    for start_m in range(lo, num_block * BLOCK_M, BLOCK_M):
+    for start_m in range(lo, num_block_m * BLOCK_M, BLOCK_M):
         offs_m_curr = start_m + offs_m
         # load q, k, v, do on-chip
         q = tl.load(q_ptrs)
         # recompute p = softmax(qk, dim=-1).T
         # NOTE: `do` is pre-divided by `l`; no normalization here
         if CAUSAL:
-            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
+            qk = tl.where(P_SEQ + offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
         else:
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
@@ -229,7 +230,7 @@ def _bwd_kernel(
     stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vk, stride_vn,
-    Z, H, N_CTX,
+    Z, H, N_CTX, P_SEQ,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SEQUENCE_PARALLEL: tl.constexpr,
@@ -249,7 +250,8 @@ def _bwd_kernel(
     DK += off_z * stride_kz + off_h * stride_kh
     DV += off_z * stride_vz + off_h * stride_vh
 
-    num_block_n = tl.cdiv(N_CTX, BLOCK_N)
+    num_block_m = tl.cdiv(N_CTX, BLOCK_M)
+    num_block_n = tl.cdiv(N_CTX + P_SEQ, BLOCK_N)
     if not SEQUENCE_PARALLEL:
         for start_n in range(0, num_block_n):
             _bwd_kernel_one_col_block(
@@ -260,8 +262,8 @@ def _bwd_kernel(
                 stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,
                 stride_kz, stride_kh, stride_kn, stride_kk,
                 stride_vz, stride_vh, stride_vk, stride_vn,
-                Z, H, N_CTX,
-                off_hz, start_n, num_block_n,
+                Z, H, N_CTX, P_SEQ,
+                off_hz, start_n, num_block_m,
                 BLOCK_M=BLOCK_M, BLOCK_DMODEL=BLOCK_DMODEL,
                 BLOCK_N=BLOCK_N,
                 SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,
@@ -277,8 +279,8 @@ def _bwd_kernel(
             stride_dqa, stride_qz, stride_qh, stride_qm, stride_qk,
             stride_kz, stride_kh, stride_kn, stride_kk,
             stride_vz, stride_vh, stride_vk, stride_vn,
-            Z, H, N_CTX,
-            off_hz, start_n, num_block_n,
+            Z, H, N_CTX, P_SEQ,
+            off_hz, start_n, num_block_m, num_block_n,
             BLOCK_M=BLOCK_M, BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_N=BLOCK_N,
             SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,
@@ -303,6 +305,7 @@ class _attention(torch.autograd.Function):
         o = torch.empty_like(q)
         grid = (cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
         L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        P_SEQ = 0 if q.shape[-2] == k.shape[-2] else k.shape[-2] - q.shape[-2]
         num_warps = 4 if Lk <= 64 else 8
         _fwd_kernel[grid](
             q, k, v, sm_scale,
@@ -312,7 +315,7 @@ class _attention(torch.autograd.Function):
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
+            q.shape[0], q.shape[1], q.shape[2], P_SEQ,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
             IS_CAUSAL=causal,
             num_warps=num_warps,
@@ -323,7 +326,7 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.BLOCK_DMODEL = Lk
         ctx.causal = causal
-        ctx.sequence_parallel = sequence_parallel
+        ctx.P_SEQ = P_SEQ
         return o
 
     @staticmethod
@@ -356,7 +359,7 @@ class _attention(torch.autograd.Function):
             o.numel(), q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
+            q.shape[0], q.shape[1], q.shape[2], ctx.P_SEQ,
             BLOCK_M=BLOCK, BLOCK_N=BLOCK,
             BLOCK_DMODEL=ctx.BLOCK_DMODEL,
             SEQUENCE_PARALLEL=sequence_parallel,
